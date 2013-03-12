@@ -2,11 +2,9 @@ require 'rubygems'
 
 module TestNodeHelper
   PORT = 38728
-  NODE = 0
 
   class << self
     attr_reader :next_port
-    attr_reader :next_node
 
     def included(klass)
       klass.send :extend,  ClassMethods
@@ -20,19 +18,13 @@ module TestNodeHelper
       @next_port += 1
       @next_port
     end
-
-    def next_node
-      @next_node ||= NODE
-      @next_node += 1
-      @next_node
-    end
   end
 
   module InstanceMethods
-    def start
+    def start(node, count)
       @port = self.class.next_port
-      @node = self.class.next_node
-      @pid = Process.spawn(Gem.ruby, File.expand_path("../../test_node.rb", __FILE__), "node_#{@node}", @port.to_s)
+      @node = node
+      @pid = Process.spawn(Gem.ruby, File.expand_path("../../test_node.rb", __FILE__), @node.to_s, @port.to_s, count.to_s)
     end
 
     def wait_until_ready

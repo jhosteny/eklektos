@@ -11,25 +11,20 @@ end
 
 RSpec.configure do |config|
   config.before(:suite) do
-    DCell.setup
-    DCell.run!
-
-    $node_1 = TestNode.new
-    $node_1.start
-    $node_1.wait_until_ready
-
-    $node_2 = TestNode.new
-    $node_2.start
-    $node_2.wait_until_ready
-
-    $node_3 = TestNode.new
-    $node_3.start
-    $node_3.wait_until_ready
+    count = 3
+    $nodes = (count - 1).times.collect do |i|
+      node = TestNode.new
+      node.start(i, count)
+      node.wait_until_ready
+      node
+    end
+    port = TestNode.next_port
+    puts "Starting in memory cell on port #{port}"
+    DCell.start :id => "node_#{count - 1}", :addr => "tcp://127.0.0.1:#{port}"
+    Elector.supervise_as :elector, *count.times.collect { |i| "node_#{i}" }
   end
 
   config.after(:suite) do
-    $node_1.stop
-    $node_2.stop
-    $node_3.stop
+    $nodes.each { |node| node.stop }
   end
 end

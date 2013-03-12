@@ -2,10 +2,10 @@ require 'spec_helper'
 
 describe Eklektos::State do
   before do
-    @state1 = Eklektos::State.new(Eklektos::Epoch.new("foo", 10))
-    @state2 = Eklektos::State.new(Eklektos::Epoch.new("foo", 20))
-    @state3 = Eklektos::State.new(Eklektos::Epoch.new("foo", 20))
-    @state3.refresh!
+    @state1 = State.new(Epoch.new("foo", 10))
+    @state2 = State.new(Epoch.new("foo", 20))
+    @state3 = State.new(Epoch.new("foo", 20))
+    @state3.refresh
   end
 
   it "should compare distinct epochs properly" do

@@ -5,17 +5,10 @@ require 'bundler'
 Bundler.setup
 
 require 'dcell'
-
-class TestElector
-  include Celluloid
-
-  def crash
-    raise "the spec purposely crashed me :("
-  end
-end
+require 'eklektos'
 
 if __FILE__ == $0
-  DCell.start :id => "#{ARGV[0]}", :addr => "tcp://127.0.0.1:#{ARGV[1]}"
-  TestElector.supervise_as :test_elector
+  DCell.start :id => "node_#{ARGV[0]}", :addr => "tcp://127.0.0.1:#{ARGV[1]}"
+  Eklektos::Elector.supervise_as :elector, *ARGV[2].to_i.times.collect { |i| "node_#{i}" }
   sleep
 end

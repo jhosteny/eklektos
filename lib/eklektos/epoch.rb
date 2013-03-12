@@ -10,10 +10,16 @@ module Eklektos
 
     # Creates a new epoch
     # @param id [String] The node id. This can be any object which uniquely identifies the DCell node and implements
-    # Comparable.
+    # Comparable, but we'll use the DCell node id (a String)
     # @param serial [Fixnum] The epoch serial number
-    def initialize(id, serial)
+    def initialize(id, serial=0)
       @id, @serial = id, serial
+    end
+
+    # Creates a new elector epoch as a copy
+    # @param other [Epoch] The epoch to copy
+    def initialize_copy(other)
+      @id, @serial = other.id, other.serial
     end
 
     # Provides lexicographic comparison of two epochs. Precedence is given to the serial number, followed by the id.
@@ -26,10 +32,19 @@ module Eklektos
       end
     end
 
+    def advance(other=nil)
+      if other
+        @serial = other.serial + 1
+      else
+        @serial += 1
+      end
+      self
+    end
+
     # Provides a string representation of epoch for debugging
     # @return [String] The epoch as a string
     def to_s
-      "<s: #{@serial}, id: #{@id}>"
+      "<s: #{@serial}, id: #{@id}, start: #{@start}>"
     end
   end
 end
