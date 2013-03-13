@@ -33,17 +33,24 @@ module Eklektos
       state <=> other.state
     end
 
-    def observe_state(other)
-      @state = other if state < other
+    def observe_state(other_state)
+      if state < other_state
+        @state = other_state.dup
+      end
       self
     end
 
     def push_state
       @old_state = state.dup
+      self
     end
     
     def update_expiration
-      @expired = state.stale?(old_state)
+      if state <= old_state
+        @expired = true
+      elsif state.epoch > old_state.epoch
+        @expired = false
+      end
       self
     end
 

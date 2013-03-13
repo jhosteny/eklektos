@@ -1,5 +1,7 @@
 module Eklektos
   class Cohort
+    extend Forwardable
+
     # The DCell id of the cohort
     attr_reader :id
 
@@ -7,8 +9,7 @@ module Eklektos
     attr_reader :name
 
     def initialize(id, name=:elector)
-      @id = id
-      @name = :elector
+      @id, @name = id, name
     end
 
     def actor

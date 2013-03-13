@@ -1,11 +1,33 @@
 require 'spec_helper'
+require 'timeout'
 
 describe Eklektos::Elector do
-#  it "should reach quorum with two nodes" do
-#    actor = DCell.me.find(:elector)
-    # The ordering here is important, since the second mock is greedy
-#    actor.wrapped_object.should_receive(:actor_for).with(DCell.me.id).once.and_return(nil)
-#    actor.wrapped_object.should_receive(:actor_for).at_least(1).and_call_original
-#    actor.quorum.size.should eq 2
-#  end
+  let(:me) { DCell.me.find(:elector) }
+
+  before :all do
+    Eklektos::Elector.class_eval { attr_reader :refresh_seq }
+  end
+
+  before :each do
+    me.send(:registered).refresh
+  end
+
+  it "should refresh all cohorts properly" do
+    expect { me.send_refresh }.to change { me.refresh_seq }.by(2)
+  end
+
+  it "should not refresh without a quorum of cohorts" do
+    me.wrapped_object.should_receive(:with_peers).with(false).once.and_return(nil)
+    expect { me.send_refresh }.to change { me.refresh_seq }.by(1)
+  end
+
+=begin
+  it "should receive a timeout when there is no quorum" do
+    me.wrapped_object.should_receive(:with_peers).with(false).once.and_return(nil)
+    me.wrapped_object.should_receive(:rtt_timeout).exactly(1).times
+    me.send_refresh
+    # Ugly!
+    sleep Eklektos::Elector::RTT_TIMEOUT + 0.1
+  end
+=end
 end
