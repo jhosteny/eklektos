@@ -35,7 +35,6 @@ module Eklektos
 
     def refresh
       @freshness += 1
-      self
     end
 
     # Provides a string representation of state for debugging

@@ -8,12 +8,15 @@ module Eklektos
     # The monotonically increasing serial number of the epoch
     attr_reader :serial
 
+    # The start time for the epoch
+    attr_reader :start
+
     # Creates a new epoch
     # @param id [String] The node id. This can be any object which uniquely identifies the DCell node and implements
     # Comparable, but we'll use the DCell node id (a String)
     # @param serial [Fixnum] The epoch serial number
     def initialize(id, serial=0)
-      @id, @serial = id, serial
+      @id, @serial, @start = id, serial, Time.now
     end
 
     # Creates a new elector epoch as a copy
@@ -38,6 +41,7 @@ module Eklektos
       else
         @serial += 1
       end
+      @start = Time.now
       self
     end
 

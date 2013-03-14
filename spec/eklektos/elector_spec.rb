@@ -4,21 +4,34 @@ require 'timeout'
 describe Eklektos::Elector do
   let(:me) { DCell.me.find(:elector) }
 
-  before :all do
-    Eklektos::Elector.class_eval { attr_reader :refresh_seq }
+  before :each do
+    me.refreshed
+    me.cohorts.values.each { |cohort| cohort.actor.refreshed unless cohort.id == DCell.id }
   end
 
-  before :each do
-    me.send(:registered).refresh
+  after :each do
+    sleep 0.1
   end
 
   it "should refresh all cohorts properly" do
-    expect { me.send_refresh }.to change { me.refresh_seq }.by(2)
+    me.wrapped_object.should_receive(:refreshed).once
+    me.send_refresh
   end
 
   it "should not refresh without a quorum of cohorts" do
     me.wrapped_object.should_receive(:with_peers).with(false).once.and_return(nil)
-    expect { me.send_refresh }.to change { me.refresh_seq }.by(1)
+    me.wrapped_object.should_not_receive(:refreshed)
+    me.send_refresh
+  end
+
+  it "should collect from all cohorts properly" do
+    views = me.views
+    me.wrapped_object.should_receive(:collected).once do |arg|
+      arg.each do |id, state|
+        views[id].state.should be < state
+      end
+    end
+    me.send_collect
   end
 
 =begin

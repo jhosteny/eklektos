@@ -33,15 +33,15 @@ module Eklektos
       state <=> other.state
     end
 
-    def observe_state(other_state)
+    def update(other_state)
       if state < other_state
-        @state = other_state.dup
+        @state = other_state
       end
       self
     end
 
     def push_state
-      @old_state = state.dup
+      @old_state = state.dup if state
       self
     end
     

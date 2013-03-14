@@ -14,7 +14,7 @@ describe Eklektos::View do
 
   it "should expire when the state is not updated" do
     @view1.push_state
-    @view1.observe_state(@view1.state)
+    @view1.update(@view1.state)
     @view1.expired?.should eq true
   end
 

@@ -17,23 +17,23 @@ module Eklektos
     # The cohort views, as we have read them from our peers
     attr_reader :views
 
-    def_delegators :"@registry[DCell.id]", :epoch, :epoch=
     def_delegators :"@views[DCell.id]", :view, :view=
-    def_delegator :DCell, :id
+    def_delegator :DCell, :id, :me
 
     def initialize(*cohort_ids)
-      cohort_ids.push DCell.id unless cohort_ids.include? DCell.id
+      cohort_ids.push me unless cohort_ids.include? me
       @cohorts  = {}
       @registry = {}
       @views    = {}
       cohort_ids.each do |id|
         @cohorts [id] = Cohort.new(id)
         @registry[id] = State.new(Epoch.new(id))
-        @views   [id] = nil
+        @views   [id] = View.new(State.new(Epoch.new(id)))
       end
       @leading     = false
-      @collecting  = false
+      @collects    = 0
       @refresh_seq = 0
+      @collect_seq = 0
     end
 
     #
@@ -41,7 +41,7 @@ module Eklektos
     #
     def refresh_timeout
       unless leading? || collecting?
-        DCell::Logger.info "Stopping refresh at follower #{id}"
+        DCell::Logger.info "Stopping refresh at follower #{me}"
         return
       end
       @refresh_timer = after(REFRESH_TIMEOUT) { refresh_timeout }
@@ -49,7 +49,7 @@ module Eklektos
     end
 
     def send_refresh
-      DCell::Logger.debug "Start refresh at #{id}"
+      DCell::Logger.debug "Start refresh at #{me}"
       @refresh_acks = 0
       @refresh_seq += 1
       @rtt_timer    = after(RTT_TIMEOUT) { rtt_timeout }
@@ -60,7 +60,7 @@ module Eklektos
       # 'q' must be strictly less than the sent value to be updated. We
       # could do a conditional check on the sender when comparing, but I
       # think this is a little clearer when comparing the code to the paper.
-      with_peers(false) { |proxy| proxy.refresh(id, @refresh_seq, registered) }
+      with_peers(false) { |proxy| proxy.refresh(me, @refresh_seq, registered) }
       
       # Now pretend we refreshed.
       refresh_ack(@refresh_seq)
@@ -82,21 +82,118 @@ module Eklektos
         @refresh_seq += 1
         @rtt_timer.cancel if @rtt_timer
         @rtt_timer = nil
-        registered.refresh
+        refreshed
       end
+    end
+
+    def refreshed
+      registered.refresh
+    end
+
+    #
+    # Collect
+    #
+    def start_collect
+      collecting = @collects > 0
+      @collects += 2
+      unless collecting
+        @refresh_timer.cancel if @refresh_timer
+        @refresh_timer = nil
+
+        # Revive our own epoch number first. This is something else
+        # that's not very clear in the paper. It states that the
+        # collect is run when the leader refresh isn't observed
+        # locally, or we observe a lower epoch in a refresh from
+        # another peer. The collect is then run twice to determine
+        # who the new leader is. Since it may be us, it is imperative
+        # to refresh ourself so that our local view is not expired
+        # by a non-increasing freshness counter in the collect. The
+        # read should happen after the full time has been allotted
+        # for the refresh to complete.
+        refresh_timeout
+
+        delayed_collect
+      end
+    end
+
+    def delayed_collect
+      @collect_timer = after(RTT_TIMEOUT) { send_collect }
+    end
+
+    def send_collect
+      @last_collect_start_time = Time.now
+      @collect_acks = 0
+      @collect_seq += 1
+      @collected_max = {}
+
+      views.each { |_, view| view.push_state }
+      with_peers(false) { |proxy| proxy.collect(me, @collect_seq) }
+    end
+
+    def collect(from, seq)
+      respond_to(from) do |proxy|
+        DCell::Logger.debug "collect at #{me}, state: #{registered}"
+        proxy.collect_ack(seq, registry)
+      end
+    end
+
+    def collect_ack(seq, registry)
+      return if @collect_seq != seq
+      registry.each do |id, state|
+        @collected_max[id] ||= registry[id]
+        @collected_max[id] = registry[id] if @collected_max[id] < registry[id]
+      end
+      @collect_acks += 1
+      if @collect_acks >= quorum
+        @collect_seq += 1
+        collected(@collected_max, @last_collect_start_timer)
+      end
+    end
+
+    def collected(max_registries, collect_start_time)
+      max_registries.each { |id, state| views[id].update(state) }
+      views.each do |id, view|
+        expired = view.expired?
+        view.update_expiration
+        DCell::Logger.debug "Cohort #{id} #{view.expired? ? 'expired' : 'unexpired'}" if view.expired? != expired
+      end
+      leader_id, leader_view = views.reject { |_, view| view.expired? }.min_by { |_, view| view.epoch }
+      set_leader(leader_id, leader_view, collect_start_time) if leader_id
+      delayed_collect
     end
 
     private
 
-    def leading?;    @leading    end
-    def collecting?; @collecting end
-
-    def registered
-      registry[DCell.id]
+    def leader_elapsed?(collect_start_time)
+      collect_start_time - registered.epoch.start >= 2 * REFRESH_TIMEOUT + 3 * RTT_TIMEOUT
     end
 
+    def set_leader(new_leader, view, collect_start_time)
+      DCell::Logger.info "Discovered leader #{new_leader}, epoch #{view.epoch} at #{me}" if @leader != new_leader
+      @leader = new_leader
+      if leading?
+        if @leader != me
+          DCell::Logger.info "#{me} lost leadership"
+          @leading = false
+        end
+      else
+        if view.epoch == registry[me].epoch && leader_elapsed?(collect_start_time)
+          DCell::Logger.info "#{me} becoming leader"
+          @leading = true
+        end
+      end
+    end
+
+    def leading?;    @leading      end
+    def collecting?; @collects > 0 end
+
+    def registered
+      registry[me]
+    end
+
+    private
     def registered=(state)
-      registry[DCell.id] = state
+      registry[me] = state
     end
 
     def quorum
@@ -104,7 +201,7 @@ module Eklektos
     end
 
     def with_peers(include_self=true, &block)
-      cohorts.values.each { |cohort| block.call(cohort.actor.async) if include_self || cohort.id != DCell.id }
+      cohorts.values.each { |cohort| block.call(cohort.actor.async) if include_self || cohort.id != me }
     end
 
     def respond_to(from, &block)
