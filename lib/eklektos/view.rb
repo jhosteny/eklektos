@@ -45,12 +45,14 @@ module Eklektos
       self
     end
     
-    def update_expiration
+    def update_expiration(&block)
+      old_expired = @expired
       if state <= old_state
         @expired = true
       elsif state.epoch > old_state.epoch
         @expired = false
       end
+      block.call(@expired) if old_expired != @expired && block
       self
     end
 
@@ -58,6 +60,10 @@ module Eklektos
     # @return Whether the view is expired
     def expired?
       expired
+    end
+
+    def expire!
+      @expired = true
     end
   end
 end
