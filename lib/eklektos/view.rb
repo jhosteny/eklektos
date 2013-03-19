@@ -35,7 +35,7 @@ module Eklektos
 
     def update(other_state)
       if state < other_state
-        @state = other_state
+        @state = other_state.dup
       end
       self
     end
@@ -64,6 +64,10 @@ module Eklektos
 
     def expire!
       @expired = true
+    end
+
+    def to_s
+      "<e: #{expired?}, s: #{state}, os: #{old_state}>"
     end
   end
 end

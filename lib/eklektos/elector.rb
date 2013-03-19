@@ -1,6 +1,7 @@
 module Eklektos
   class Elector
     include Celluloid
+    include Celluloid::FSM
     extend Forwardable
 
     # Failure detection and leader election
@@ -21,6 +22,7 @@ module Eklektos
     def_delegator :DCell, :id, :me
 
     def initialize(*cohort_ids)
+      super()
       cohort_ids.push me unless cohort_ids.include? me
       @cohorts  = {}
       @registry = {}
@@ -30,24 +32,240 @@ module Eklektos
         @registry[id] = State.new(Epoch.new(id))
         @views   [id] = View.new(State.new(Epoch.new(id)))
       end
-      @leading    = false
-      @exiting    = false
-      @collecting = false
-      @ticks      = 0
     end
 
-    def interval(secs, &block)
-      start = Time.now
-      block.call
-      rest = secs - (Time.now - start)
-      sleep(rest) if rest > 0
+    # FSM
+    default_state :start
+    state :start do
+      epoch_process
+      transition :collecting
     end
 
-    def pause(process)
-      DCell::Logger.info "Stopping #{process}"
-      unless exiting?
-        wait(process)
-        DCell::Logger.info "Starting #{process}" unless exiting?
+    state :collecting do
+      DCell::Logger.debug "Collecting"
+      # Revive our own epoch number first. This is something else
+      # that's not very clear in the paper. It states that the
+      # collect is run when the leader refresh isn't observed
+      # locally, or we observe a lower epoch in a refresh from
+      # another peer. The collect is then run twice to determine
+      # who the new leader is. Since it may be us, it is imperative
+      # to refresh ourself so that our local view is not expired
+      # by a non-increasing freshness counter in the collect. The
+      # read should happen after the full time has been allotted
+      # for the refresh to complete.
+      refresh_once
+
+      # Now refresh for the duration of the collect
+      timer = every(REFRESH_TIMEOUT) { refresh_once }
+
+      collect_process
+
+      timer.cancel
+
+      # This appears to be important. TODO: figure out why
+      # we crash otherwise
+      nil
+    end
+
+    # We need separate states since we can't transition back
+    # into the same state. It seems like this has changed in
+    # Celluloid, since the DCell heartbeat mechanism appears
+    # to assume that you can. TODO: investigate.
+    state :leading do
+      transition :reaffirm_leading, :delay => REFRESH_TIMEOUT
+      refresh_process
+    end
+
+    state :reaffirm_leading do
+      DCell::Logger.debug "Reaffirming leadership"
+      transition :leading
+    end
+
+    state :advance do
+      epoch_process
+      transition :leading
+    end
+
+    state :following do
+      # Unless the heartbeat is received, look for a new leader
+      transition :collecting, :delay => 2 * REFRESH_TIMEOUT
+    end
+
+    state :reaffirm_following do
+      DCell::Logger.debug "Reaffirming following"
+      transition :following
+    end
+
+    state :shutdown
+    
+    #
+    # Refresh
+    #
+    def refresh_once
+      loop do
+        break if refresh_internal do
+          epoch_process
+        end
+      end
+    end
+
+    def refresh_process
+      refresh_internal do
+        transition :advance
+      end
+    end
+
+    def refreshed
+      registered.refresh
+      DCell::Logger.debug "Refreshed #{registered}"
+    end
+
+    def refresh(from, seq, state)
+      respond_to(from) do |proxy|
+        if registry[from] < state
+          registry[from] = state
+          proxy.refresh_ack(seq)
+        end
+
+        if @leader
+          # Start a collect if we detect a stale epoch.
+          if views[@leader].epoch > registry[from].epoch
+            DCell::Logger.info "Saw epoch #{registry[from].epoch} from #{from} " +
+              "less than leader #{@leader} epoch #{views[@leader].epoch}"
+            transition :collecting
+          elsif from == @leader
+            # Keep the watchdog happy.
+            transition :reaffirm_following
+          end
+        end
+      end
+    end
+
+    def refresh_ack(seq)
+      signal :refreshed, seq
+    end
+
+    #
+    # Epoch
+    #
+    def epoch_process
+      loop do
+        set_leadership(false)
+        view.expire!
+        max = registered.epoch
+
+        @epoch_sequence ||= 0
+        @epoch_sequence  += 1
+
+        # We only send this to our peers, not ourself, since we already
+        # have set the max epoch value to our own epoch.
+        with_peers { |proxy| proxy.get_max_epoch(me, @epoch_sequence) }
+      
+        # Now pretend we called ourself.
+        async.get_max_epoch_ack(@epoch_sequence, max)
+
+        timeout = quorum_wait(:advanced, @epoch_sequence, RTT_TIMEOUT) do |epoch|
+          max = epoch if epoch > max
+        end
+
+        if timeout
+          DCell::Logger.debug "Advance epoch timeout"
+        else
+          got_max_epoch(max)
+          break
+        end
+      end
+    end
+
+    def got_max_epoch(max_epoch)
+      registered.epoch.advance(max_epoch)
+      DCell::Logger.debug "Setting epoch to #{registered.epoch}"
+    end
+
+    def get_max_epoch(from, seq)
+      respond_to(from) do |proxy|
+        proxy.get_max_epoch_ack(seq, registry.values.max_by(&:epoch).epoch)
+      end
+    end
+
+    def get_max_epoch_ack(seq, max_epoch)
+      signal :advanced, [seq, max_epoch]
+    end
+
+    #
+    # Collect
+    #
+    def collect_process
+      loop do
+        last_read_start_time = Time.now
+        
+        @collect_sequence ||= 0
+        @collect_sequence  += 1
+
+        # Save the old views
+        views.each { |_, view| view.push_state }
+
+        # Send to ourself, too. We have the registry locally, but
+        # this simplifies collecting the result a bit.
+        with_peers(true) { |proxy| proxy.collect(me, @collect_sequence) }
+
+        timeout = quorum_wait(:collected, @collect_sequence, RTT_TIMEOUT) do |remote_registry|
+          remote_registry.each { |id, state| views[id].update(state) }
+        end
+
+        if timeout
+          DCell::Logger.debug "Collect timeout"
+        else
+          collected(last_read_start_time)
+          break if state != :collecting
+          sleep(READ_TIMEOUT)
+        end
+      end
+    end
+
+    def collected(last_read_start_time)
+      views.each do |id, view|
+        view.update_expiration do |expired|
+          DCell::Logger.debug "View #{id} #{expired ? 'expired' : 'unexpired'}"
+        end
+      end
+      set_leader(find_leader, last_read_start_time)
+    end
+
+    def collect(from, seq)
+      respond_to(from) do |proxy|
+        proxy.collect_ack(seq, registry)
+      end
+    end
+
+    def collect_ack(seq, remote_registry)
+      signal :collected, [seq, remote_registry]
+    end
+
+    private
+
+    def refresh_internal(&block)
+      @refresh_sequence ||= 0
+      @refresh_sequence  += 1
+
+      # We only send this to our peers, not ourself, since the check for
+      # refreshing the registry is that the value 'r' sent from a process
+      # 'p' to a process 'q' is that the local registry value for 'p' at
+      # 'q' must be strictly less than the sent value to be updated. We
+      # could do a conditional check on the sender when comparing, but I
+      # think this is a little clearer when comparing the code to the paper.
+      with_peers { |proxy| proxy.refresh(me, @refresh_sequence, registered) }
+      
+      # Now pretend we refreshed.
+      async.refresh_ack(@refresh_sequence)
+
+      if quorum_wait(:refreshed, @refresh_sequence, RTT_TIMEOUT)
+        DCell::Logger.debug "Refresh timeout"
+        block.call if block
+        false
+      else
+        refreshed
+        true
       end
     end
 
@@ -70,160 +288,6 @@ module Eklektos
       false
     end
 
-    #
-    # Refresh
-    #
-    def refresh_process
-      sequence = 0
-      loop do
-        unless leading? || collecting?
-          pause(:refresh)
-          return if exiting?
-        end
-
-        sequence += 1
-
-        # We only send this to our peers, not ourself, since the check for
-        # refreshing the registry is that the value 'r' sent from a process
-        # 'p' to a process 'q' is that the local registry value for 'p' at
-        # 'q' must be strictly less than the sent value to be updated. We
-        # could do a conditional check on the sender when comparing, but I
-        # think this is a little clearer when comparing the code to the paper.
-        with_peers { |proxy| proxy.refresh(me, sequence, registered) }
-      
-        # Now pretend we refreshed.
-        async.refresh_ack(sequence)
-
-        interval(REFRESH_TIMEOUT) do
-          if quorum_wait(:refreshed, sequence, RTT_TIMEOUT)
-            refresh_timeout
-            break
-          end
-          refreshed
-        end
-      end
-    end
-
-    def refreshed
-      registered.refresh
-    end
-
-    def refresh_timeout
-      DCell::Logger.debug "Refresh timeout"
-      set_leadership(false)
-      view.expire!
-      epoch_timeout
-    end
-
-    def refresh(from, seq, state)
-      respond_to(from) do |proxy|
-        @ticks += 1 if from == @leader
-        if registry[from] < state
-          registry[from] = state
-          proxy.refresh_ack(seq)
-        end
-      end
-    end
-
-    def refresh_ack(seq)
-      signal :refreshed, seq
-    end
-
-    #
-    # Collect
-    #
-    def collect_process(immediate=false)
-      sequence = 0
-      loop do
-        unless immediate
-          @collecting = false
-          pause(:collect)
-          return if exiting?
-          @collecting = true
-        end
-        immediate = false
-
-        # Revive our own epoch number first. This is something else
-        # that's not very clear in the paper. It states that the
-        # collect is run when the leader refresh isn't observed
-        # locally, or we observe a lower epoch in a refresh from
-        # another peer. The collect is then run twice to determine
-        # who the new leader is. Since it may be us, it is imperative
-        # to refresh ourself so that our local view is not expired
-        # by a non-increasing freshness counter in the collect. The
-        # read should happen after the full time has been allotted
-        # for the refresh to complete.
-        #
-        # We sleep twice the RTT_TIMEOUT to allow any outstanding
-        # refresh to complete, followed by the refresh to revive
-        # our local view.
-        signal :refresh
-        sleep(2 * RTT_TIMEOUT)
-
-        times = 2
-        while times > 0
-          puts "Collecting time #{times}"
-          last_read_start_time = Time.now
-          sequence += 1
-
-          # Save the old views
-          views.each { |_, view| view.push_state }
-
-          # Send to ourself, too. We have the registry locally, but
-          # this simplifies collecting the result a bit.
-          with_peers(true) { |proxy| proxy.collect(me, sequence) }
-
-          timeout = quorum_wait(:collected, sequence, RTT_TIMEOUT) do |remote_registry|
-            remote_registry.each { |id, state| views[id].update(state) }
-          end
-
-          if timeout
-            DCell::Logger.debug "Collect timeout"
-          else
-            collected(last_read_start_time)
-            times -= 1
-            sleep(READ_TIMEOUT)
-          end
-        end
-      end
-    end
-
-    def collected(last_read_start_time)
-      views.each do |id, view|
-        view.update_expiration do |expired|
-          DCell::Logger.debug "Cohort #{id} #{expired ? 'expired' : 'unexpired'}"
-        end
-      end
-      set_leader(find_leader, last_read_start_time)
-    end
-
-    def collect(from, seq)
-      respond_to(from) do |proxy|
-        proxy.collect_ack(seq, registry)
-      end
-    end
-
-    def collect_ack(seq, remote_registry)
-      signal :collected, [seq, remote_registry]
-    end
-
-    def watchdog_process
-      loop do
-        if leading?
-          pause(:watchdog)
-          return if exiting?
-        end
-        captured = @ticks
-        sleep(2 * REFRESH_TIMEOUT)
-        if @ticks == captured
-          DCell::Logger.debug "Watchdog timeout on #{@leader}"
-          signal :collect
-        end
-      end
-    end
-
-    private
-
     def find_leader
       leader_id, _ = views.reject { |_, view| view.expired? }.min_by { |_, view| view.epoch }
       leader_id
@@ -238,7 +302,7 @@ module Eklektos
           set_leadership(false)
         end
       else
-        if views[leader_id].epoch == registry[me].epoch &&
+         if views[leader_id].epoch == registry[me].epoch &&
             (collect_start_time - registered.epoch.start) >= LEADER_TIMEOUT
           set_leadership(true)
         end
@@ -246,21 +310,18 @@ module Eklektos
     end
 
     def set_leadership(leading)
-      if @leading != leading
-        @leading = leading
-        if @leading
+      if leading? != leading
+        if leading
           DCell::Logger.info "#{me} becoming leader #{@leader}"
-          signal :refresh
+          transition :leading
         else
           DCell::Logger.info "#{me} lost leadership"
-          signal :watchdog
+          transition :following
         end
       end
     end
 
-    def exiting?;    @exiting    end
-    def leading?;    @leading    end
-    def collecting?; @collecting end
+    def leading?; state == :leading end
 
     def registered
       registry[me]
@@ -285,10 +346,6 @@ module Eklektos
     def respond_to(from, &block)
       cohort = cohorts[from]
       block.call(cohort.actor) if cohort
-    end
-
-    def crash
-      raise "test crash"
     end
   end
 end

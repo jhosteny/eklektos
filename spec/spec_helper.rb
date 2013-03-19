@@ -19,7 +19,7 @@ RSpec.configure do |config|
       node
     end
     port = TestNode.next_port
-    puts "Starting in memory cell on port #{port}"
+    puts "Starting in memory cell (#{Process.pid}) on port #{port}"
     DCell.start :id => "node_#{count - 1}", :addr => "tcp://127.0.0.1:#{port}"
     Elector.supervise_as :elector, *count.times.collect { |i| "node_#{i}" }
   end

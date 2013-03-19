@@ -28,7 +28,7 @@ module TestNodeHelper
     end
 
     def wait_until_ready
-      STDERR.print "Waiting for test node at port #{@port} to start up..."
+      STDERR.print "Waiting for test node (#{@pid}) at port #{@port} to start up..."
 
       socket = nil
       30.times do
